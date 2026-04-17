@@ -1,6 +1,7 @@
 import random
 import json
 import asyncio
+import aiosqlite
 from typing import Dict, Any, Union
 from enum import Enum
 
@@ -26,27 +27,36 @@ class Condition(str, Enum):
 # Represents libraries like `aiosqlite` and `redis.asyncio`
 # =============================================================================
 
-class MockAsyncConnection:
-    """Mocks asynchronous sqlite3 connection/cursor behavior."""
-    def __init__(self):
-        print("--- [DEBUG] Async SQLite connection established (MOCK) ---")
-        # NOTE: Updated to store RAW SCORES instead of modifiers. 
-        # Added 'temp_hp' field.
-        self.data = {
-            "Player1": {"hp": 25, "max_hp": 25, "temp_hp": 5, "ac": 15, "stats": {"Str": 16, "Dex": 14, "Con": 12, "Int": 14, "Wis": 14, "Cha": 12}, "effects": "[]"},
-            "Enemy1": {"hp": 30, "max_hp": 30, "temp_hp": 0, "ac": 12, "stats": {"Str": 12, "Dex": 14, "Con": 12, "Int": 12, "Wis": 12, "Cha": 12}, "effects": "[]"}
-        }
-
-    async def execute(self, query: str, params=()):
-        print(f"   [DB WRITE/READ] Executing async query: {query[:30]}...")
-        await asyncio.sleep(0.01) # Simulate network latency
-
-    async def commit(self):
-        print("   [DB WRITE] Changes committed asynchronously.")
-        await asyncio.sleep(0.01)
-    
-    async def close(self):
-        print("--- [DEBUG] Async SQLite connection closed (MOCK) ---")
+async def init_db(db_path: str = "dnd_database.db"):
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS characters (
+                id TEXT PRIMARY KEY,
+                hp INTEGER,
+                max_hp INTEGER,
+                temp_hp INTEGER,
+                ac INTEGER,
+                stats TEXT,
+                effects TEXT
+            )
+        ''')
+        
+        async with db.execute("SELECT COUNT(*) FROM characters") as cursor:
+            row = await cursor.fetchone()
+            if row and row[0] == 0:
+                print("--- [DEBUG] Seeding database with initial characters ---")
+                player_stats = json.dumps({"Str": 16, "Dex": 14, "Con": 12, "Int": 14, "Wis": 14, "Cha": 12})
+                enemy_stats = json.dumps({"Str": 12, "Dex": 14, "Con": 12, "Int": 12, "Wis": 12, "Cha": 12})
+                
+                await db.execute(
+                    "INSERT INTO characters (id, hp, max_hp, temp_hp, ac, stats, effects) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    ("Player1", 25, 25, 5, 15, player_stats, "[]")
+                )
+                await db.execute(
+                    "INSERT INTO characters (id, hp, max_hp, temp_hp, ac, stats, effects) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    ("Enemy1", 30, 30, 0, 12, enemy_stats, "[]")
+                )
+        await db.commit()
 
 class MockAsyncRedisClient:
     """Mocks asynchronous redis client behavior."""
@@ -68,10 +78,10 @@ class MockAsyncRedisClient:
 # =============================================================================
 
 class DndEngine:
-    def __init__(self, db_connection: MockAsyncConnection, redis_client: MockAsyncRedisClient):
+    def __init__(self, db_connection: aiosqlite.Connection, redis_client: MockAsyncRedisClient):
         self.db = db_connection
         self.cache = redis_client
-        print("\n✅ Async DndEngine Initialized: Ready to calculate.")
+        print("\n[OK] Async DndEngine Initialized: Ready to calculate.")
     
     # -------------------------------------------------------------------------
     # A. Utility Functions
@@ -98,13 +108,17 @@ class DndEngine:
     async def get_character_state(self, char_id: str) -> Dict[str, Any]:
         """Pulls and parses canonical data from the async database."""
         print(f"\n[DB FETCH] Retrieving state for {char_id}...")
-        await self.db.execute("SELECT * FROM characters WHERE id = ?", (char_id,))
+        async with self.db.execute("SELECT * FROM characters WHERE id = ?", (char_id,)) as cursor:
+            row = await cursor.fetchone()
         
-        state = self.db.data.get(char_id, {})
-        if not state:
+        if not row:
             return {"error": "Character not found."}
         
-        # FIX: Deserialize the JSON string back into a Python list
+        state = dict(row)
+        
+        if isinstance(state.get("stats"), str):
+            state["stats"] = json.loads(state["stats"])
+            
         if isinstance(state.get("effects"), str):
             state["effects"] = json.loads(state["effects"])
             
@@ -114,12 +128,22 @@ class DndEngine:
         """Persists changes to the async database."""
         print(f"[DB UPDATE] Updating state for {char_id}...")
         
-        # FIX: Serialize lists to JSON strings before saving to SQLite
-        if "effects" in updates and isinstance(updates["effects"], list):
-            updates["effects"] = json.dumps(updates["effects"])
-
-        await self.db.execute("UPDATE characters SET ... WHERE id = ?", (char_id,))
-        self.db.data[char_id].update(updates)
+        if not updates:
+            return {"status": "no updates provided"}
+            
+        set_clauses = []
+        values = []
+        for key, value in updates.items():
+            set_clauses.append(f"{key} = ?")
+            if key in ["stats", "effects"] and isinstance(value, (dict, list)):
+                values.append(json.dumps(value))
+            else:
+                values.append(value)
+                
+        query = f"UPDATE characters SET {', '.join(set_clauses)} WHERE id = ?"
+        values.append(char_id)
+        
+        await self.db.execute(query, tuple(values))
         await self.db.commit()
         return {"status": "success"}
 
@@ -231,7 +255,9 @@ class DndEngine:
 # =============================================================================
 
 async def main():
-    db_conn = MockAsyncConnection()
+    await init_db()
+    db_conn = await aiosqlite.connect("dnd_database.db")
+    db_conn.row_factory = aiosqlite.Row
     redis_client = MockAsyncRedisClient()
     engine = DndEngine(db_conn, redis_client)
 
