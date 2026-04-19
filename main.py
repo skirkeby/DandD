@@ -2,6 +2,7 @@ import random
 import json
 import asyncio
 import aiosqlite
+import ollama
 from typing import Dict, Any, Union
 from enum import Enum
 
@@ -31,33 +32,28 @@ DB_PATH = "dnd_database.db"
 
 async def init_db(db_path: str = DB_PATH):
     async with aiosqlite.connect(db_path) as db:
+        # Drop and recreate for the new per-channel schema
+        await db.execute('DROP TABLE IF EXISTS characters')
         await db.execute('''
-            CREATE TABLE IF NOT EXISTS characters (
-                id TEXT PRIMARY KEY,
+            CREATE TABLE characters (
+                id TEXT,
+                channel_id TEXT,
                 hp INTEGER,
                 max_hp INTEGER,
                 temp_hp INTEGER,
                 ac INTEGER,
                 stats TEXT,
-                effects TEXT
+                effects TEXT,
+                PRIMARY KEY (id, channel_id)
             )
         ''')
         
-        async with db.execute("SELECT COUNT(*) FROM characters") as cursor:
-            row = await cursor.fetchone()
-            if row and row[0] == 0:
-                print("--- [DEBUG] Seeding database with initial characters ---")
-                player_stats = json.dumps({"Str": 16, "Dex": 14, "Con": 12, "Int": 14, "Wis": 14, "Cha": 12})
-                enemy_stats = json.dumps({"Str": 12, "Dex": 14, "Con": 12, "Int": 12, "Wis": 12, "Cha": 12})
-                
-                await db.execute(
-                    "INSERT INTO characters (id, hp, max_hp, temp_hp, ac, stats, effects) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    ("Player1", 25, 25, 5, 15, player_stats, "[]")
-                )
-                await db.execute(
-                    "INSERT INTO characters (id, hp, max_hp, temp_hp, ac, stats, effects) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    ("Enemy1", 30, 30, 0, 12, enemy_stats, "[]")
-                )
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS channel_settings (
+                channel_id TEXT PRIMARY KEY,
+                llm_engine TEXT
+            )
+        ''')
         await db.commit()
 
 class MockAsyncRedisClient:
@@ -107,10 +103,10 @@ class DndEngine:
     # B. Character State Management
     # -------------------------------------------------------------------------
 
-    async def get_character_state(self, char_id: str) -> Dict[str, Any]:
+    async def get_character_state(self, channel_id: str, char_id: str) -> Dict[str, Any]:
         """Pulls and parses canonical data from the async database."""
-        print(f"\n[DB FETCH] Retrieving state for {char_id}...")
-        async with self.db.execute("SELECT * FROM characters WHERE id = ?", (char_id,)) as cursor:
+        print(f"\n[DB FETCH] Retrieving state for {char_id} in {channel_id}...")
+        async with self.db.execute("SELECT * FROM characters WHERE id = ? AND channel_id = ?", (char_id, channel_id)) as cursor:
             row = await cursor.fetchone()
         
         if not row:
@@ -126,9 +122,9 @@ class DndEngine:
             
         return state
 
-    async def update_character_state(self, char_id: str, updates: dict):
+    async def update_character_state(self, channel_id: str, char_id: str, updates: dict):
         """Persists changes to the async database."""
-        print(f"[DB UPDATE] Updating state for {char_id}...")
+        print(f"[DB UPDATE] Updating state for {char_id} in {channel_id}...")
         
         if not updates:
             return {"status": "no updates provided"}
@@ -142,19 +138,82 @@ class DndEngine:
             else:
                 values.append(value)
                 
-        query = f"UPDATE characters SET {', '.join(set_clauses)} WHERE id = ?"
-        values.append(char_id)
+        query = f"UPDATE characters SET {', '.join(set_clauses)} WHERE id = ? AND channel_id = ?"
+        values.extend([char_id, channel_id])
         
         await self.db.execute(query, tuple(values))
         await self.db.commit()
         return {"status": "success"}
 
+    async def set_channel_llm_engine(self, channel_id: str, engine_type: str) -> Dict[str, Any]:
+        """Sets the LLM engine preference for a specific Discord channel."""
+        print(f"[DB UPDATE] Setting LLM engine for channel {channel_id} to {engine_type}")
+        
+        await self.db.execute('''
+            INSERT INTO channel_settings (channel_id, llm_engine) 
+            VALUES (?, ?)
+            ON CONFLICT(channel_id) DO UPDATE SET llm_engine = excluded.llm_engine
+        ''', (channel_id, engine_type))
+        await self.db.commit()
+        return {"status": "success", "channel_id": channel_id, "llm_engine": engine_type}
+
+    async def get_channel_llm_engine(self, channel_id: str) -> str:
+        """Gets the LLM engine preference for a specific Discord channel."""
+        async with self.db.execute("SELECT llm_engine FROM channel_settings WHERE channel_id = ?", (channel_id,)) as cursor:
+            row = await cursor.fetchone()
+        
+        if row:
+            # For aiosqlite, row object is either tuple or sqlite3.Row.
+            # Using index 0 allows retrieving the exact column queried.
+            return row[0]
+        return "gemini" # Default value
+
+    async def generate_ai_response(self, channel_id: str, prompt: str) -> str:
+        """Generates an AI response using the configured LLM engine."""
+        engine_type = await self.get_channel_llm_engine(channel_id)
+        
+        if engine_type == "ollama":
+            try:
+                print(f"[Ollama] Generating response for channel {channel_id} with gemma4:e4b")
+                client = ollama.AsyncClient()
+                response = await client.generate(model='gemma4:e4b', prompt=prompt)
+                return response['response']
+            except Exception as e:
+                return f"⚠️ Error connecting to local Ollama (gemma4:e4b): {e}"
+        else:
+            return f"⚠️ Engine '{engine_type}' is not yet implemented for generating responses."
+
+    async def start_new_game(self, channel_id: str, num_characters: int, adventure_type: str) -> str:
+        """Wipes characters for the channel and seeds new ones based on prompts."""
+        # Wipe existing characters for this channel
+        await self.db.execute("DELETE FROM characters WHERE channel_id = ?", (channel_id,))
+        
+        # Seed new characters
+        player_stats = json.dumps({"Str": 16, "Dex": 14, "Con": 12, "Int": 14, "Wis": 14, "Cha": 12})
+        for i in range(num_characters):
+            char_id = f"Player{i+1}"
+            await self.db.execute(
+                "INSERT INTO characters (id, channel_id, hp, max_hp, temp_hp, ac, stats, effects) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (char_id, channel_id, 25, 25, 0, 15, player_stats, "[]")
+            )
+            
+        enemy_stats = json.dumps({"Str": 12, "Dex": 14, "Con": 12, "Int": 12, "Wis": 12, "Cha": 12})
+        await self.db.execute(
+            "INSERT INTO characters (id, channel_id, hp, max_hp, temp_hp, ac, stats, effects) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("Enemy1", channel_id, 30, 30, 0, 12, enemy_stats, "[]")
+        )
+        await self.db.commit()
+        
+        intro_prompt = f"Write a short, engaging opening narration for a new D&D adventure of type '{adventure_type}' with {num_characters} heroes. Keep it under 150 words. Do NOT provide any options or choices for the adventure; simply set the stage and describe the scene that is currently happening."
+        intro_text = await self.generate_ai_response(channel_id, intro_prompt)
+        return intro_text
+
     # -------------------------------------------------------------------------
     # C. Core Ability Check Function
     # -------------------------------------------------------------------------
 
-    async def perform_ability_check(self, player_id: str, stat_type: Stat, target_dc: int) -> Dict[str, Any]:
-        state = await self.get_character_state(player_id)
+    async def perform_ability_check(self, channel_id: str, player_id: str, stat_type: Stat, target_dc: int) -> Dict[str, Any]:
+        state = await self.get_character_state(channel_id, player_id)
         
         # Retrieve the RAW score from the database
         raw_score = state.get("stats", {}).get(stat_type.value)
@@ -182,9 +241,9 @@ class DndEngine:
     # D. Specialized Mechanics
     # -------------------------------------------------------------------------
 
-    async def combat_initiative(self, player_id: str, channel_id: str) -> Dict[str, Any]:
+    async def combat_initiative(self, channel_id: str, player_id: str) -> Dict[str, Any]:
         """Rolls initiative and maps it to a specific Discord channel."""
-        state = await self.get_character_state(player_id)
+        state = await self.get_character_state(channel_id, player_id)
         if "error" in state:
             return {"action": "Combat Initiative", "player_id": player_id, "success": False, "error": state["error"]}
             
@@ -205,9 +264,9 @@ class DndEngine:
             "cache_key": key
         }
 
-    async def apply_damage(self, target_id: str, damage_amount: int) -> Dict[str, Any]:
+    async def apply_damage(self, channel_id: str, target_id: str, damage_amount: int) -> Dict[str, Any]:
         """Applies damage, prioritizing Temporary HP before actual HP."""
-        state = await self.get_character_state(target_id)
+        state = await self.get_character_state(channel_id, target_id)
         if "error" in state:
             return {"action": "Damage Application", "target": target_id, "success": False, "error": state["error"]}
             
@@ -227,7 +286,7 @@ class DndEngine:
         
         new_hp = max(0, hp - damage_remaining)
 
-        await self.update_character_state(target_id, {
+        await self.update_character_state(channel_id, target_id, {
             "hp": new_hp,
             "temp_hp": temp_hp
         })
@@ -240,8 +299,8 @@ class DndEngine:
             "temp_hp_after": temp_hp
         }
 
-    async def apply_status_effect(self, target_id: str, effect: Condition, duration: int) -> Dict[str, Any]:
-        state = await self.get_character_state(target_id)
+    async def apply_status_effect(self, channel_id: str, target_id: str, effect: Condition, duration: int) -> Dict[str, Any]:
+        state = await self.get_character_state(channel_id, target_id)
         if "error" in state:
             return {"action": "Status Effect", "target": target_id, "success": False, "error": state["error"]}
             
@@ -252,7 +311,7 @@ class DndEngine:
             "duration": duration
         })
         
-        await self.update_character_state(target_id, {"effects": effects_list})
+        await self.update_character_state(channel_id, target_id, {"effects": effects_list})
 
         return {
             "action": "Status Effect",
@@ -273,28 +332,23 @@ async def main():
     engine = DndEngine(db_conn, redis_client)
 
     print("\n" + "="*60)
-    print("TEST: ASYNC ACROBATICS CHECK")
+    print("TEST: START NEW GAME & ASYNC DEMONSTRATIONS")
     print("="*60)
+    mock_discord_channel_id = "1049382059384"
     
-    check_result = await engine.perform_ability_check("Player1", Stat.DEX, 16)
+    # Initialize game for channel
+    intro = await engine.start_new_game(mock_discord_channel_id, 1, "dungeon delve")
+    print(f"Intro: {intro[:100]}...\n")
+    
+    check_result = await engine.perform_ability_check(mock_discord_channel_id, "Player1", Stat.DEX, 16)
     print(json.dumps(check_result, indent=4))
 
-    print("\n" + "="*60)
-    print("TEST: ASYNC DAMAGE (With Temp HP logic)")
-    print("="*60)
-    
-    damage_result = await engine.apply_damage("Player1", 8)
+    damage_result = await engine.apply_damage(mock_discord_channel_id, "Player1", 8)
     print(json.dumps(damage_result, indent=4))
     
-    print("\n" + "="*60)
-    print("TEST: CHANNEL-BOUND INITIATIVE & STATUS EFFECT")
-    print("="*60)
+    await engine.combat_initiative(mock_discord_channel_id, "Player1")
     
-    # Simulating a command run in a specific discord channel
-    mock_discord_channel_id = "1049382059384"
-    await engine.combat_initiative("Player1", mock_discord_channel_id)
-    
-    status_result = await engine.apply_status_effect("Enemy1", Condition.POISONED, 3)
+    status_result = await engine.apply_status_effect(mock_discord_channel_id, "Enemy1", Condition.POISONED, 3)
     print(json.dumps(status_result, indent=4))
 
     await db_conn.close()
