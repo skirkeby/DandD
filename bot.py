@@ -221,7 +221,33 @@ async def new_game_cmd(ctx):
             await ctx.send("❌ Invalid number. Cancelling new game.")
             return
             
-        await ctx.send("What kind of adventure is this? (e.g., 'dungeon delve', 'city heist', 'forest mystery')")
+        characters_info = []
+
+        for i in range(num_players):
+            await ctx.send(f"**--- Player {i+1} ---**\nWhat is your character's Name?")
+            name_msg = await bot.wait_for('message', timeout=60.0, check=check)
+            
+            await ctx.send(f"What is {name_msg.content}'s Race?")
+            race_msg = await bot.wait_for('message', timeout=60.0, check=check)
+            
+            await ctx.send(f"What is {name_msg.content}'s Class?")
+            class_msg = await bot.wait_for('message', timeout=60.0, check=check)
+            
+            await ctx.send(f"What is one defining physical feature for {name_msg.content}?")
+            phys_msg = await bot.wait_for('message', timeout=60.0, check=check)
+            
+            await ctx.send(f"What is one defining personality trait for {name_msg.content}?")
+            pers_msg = await bot.wait_for('message', timeout=60.0, check=check)
+            
+            characters_info.append({
+                "name": name_msg.content,
+                "race": race_msg.content,
+                "class": class_msg.content,
+                "physical": phys_msg.content,
+                "personality": pers_msg.content
+            })
+            
+        await ctx.send("Finally, what kind of adventure is this? (e.g., 'dungeon delve', 'city heist', 'forest mystery')")
         msg = await bot.wait_for('message', timeout=60.0, check=check)
         adventure_type = msg.content
         
@@ -230,7 +256,7 @@ async def new_game_cmd(ctx):
         await ctx.send(f"⏳ Generating a new {adventure_type} adventure for {num_players} players... Stand by.")
         
         async with ctx.typing():
-            intro = await engine.start_new_game(channel_id, num_players, adventure_type)
+            intro = await engine.start_new_game(channel_id, characters_info, adventure_type)
             
         if len(intro) > 1990:
             intro = intro[:1990] + "..."

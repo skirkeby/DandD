@@ -99,6 +99,32 @@ class DndEngine:
         # FIX: Corrected math formula -> (Score - 10) / 2
         return (stat_score - 10) // 2
 
+    @staticmethod
+    def generate_class_stats(char_class: str) -> dict:
+        """Generates stats fitting the class natively. Simple heuristic."""
+        base_stats = {"Str": 10, "Dex": 10, "Con": 12, "Int": 10, "Wis": 10, "Cha": 10}
+        char_class = char_class.lower()
+        if "fighter" in char_class or "barbarian" in char_class or "paladin" in char_class:
+            base_stats["Str"] = 16
+            base_stats["Con"] = 14
+        elif "rogue" in char_class or "ranger" in char_class or "monk" in char_class:
+            base_stats["Dex"] = 16
+            base_stats["Wis"] = 14
+        elif "wizard" in char_class or "artificer" in char_class:
+            base_stats["Int"] = 16
+            base_stats["Dex"] = 14
+        elif "cleric" in char_class or "druid" in char_class:
+            base_stats["Wis"] = 16
+            base_stats["Con"] = 14
+        elif "bard" in char_class or "sorcerer" in char_class or "warlock" in char_class:
+            base_stats["Cha"] = 16
+            base_stats["Dex"] = 14
+        else:
+            base_stats["Str"] = 14
+            base_stats["Dex"] = 14
+            base_stats["Con"] = 14
+        return base_stats
+
     # -------------------------------------------------------------------------
     # B. Character State Management
     # -------------------------------------------------------------------------
@@ -183,18 +209,27 @@ class DndEngine:
         else:
             return f"⚠️ Engine '{engine_type}' is not yet implemented for generating responses."
 
-    async def start_new_game(self, channel_id: str, num_characters: int, adventure_type: str) -> str:
-        """Wipes characters for the channel and seeds new ones based on prompts."""
+    async def start_new_game(self, channel_id: str, characters_info: list, adventure_type: str) -> str:
+        """Wipes characters for the channel and seeds new ones based on detailed inputs."""
         # Wipe existing characters for this channel
         await self.db.execute("DELETE FROM characters WHERE channel_id = ?", (channel_id,))
         
-        # Seed new characters
-        player_stats = json.dumps({"Str": 16, "Dex": 14, "Con": 12, "Int": 14, "Wis": 14, "Cha": 12})
-        for i in range(num_characters):
-            char_id = f"Player{i+1}"
+        char_descriptions = []
+        for char in characters_info:
+            c_name = char["name"]
+            c_race = char["race"]
+            c_class = char["class"]
+            c_phys = char["physical"]
+            c_pers = char["personality"]
+            
+            char_descriptions.append(f"- {c_name} ({c_race} {c_class}): {c_phys}, {c_pers}")
+            
+            stats_dict = self.generate_class_stats(c_class)
+            stats_json = json.dumps(stats_dict)
+            
             await self.db.execute(
                 "INSERT INTO characters (id, channel_id, hp, max_hp, temp_hp, ac, stats, effects) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (char_id, channel_id, 25, 25, 0, 15, player_stats, "[]")
+                (c_name, channel_id, 25, 25, 0, 15, stats_json, "[]")
             )
             
         enemy_stats = json.dumps({"Str": 12, "Dex": 14, "Con": 12, "Int": 12, "Wis": 12, "Cha": 12})
@@ -204,7 +239,12 @@ class DndEngine:
         )
         await self.db.commit()
         
-        intro_prompt = f"Write a short, engaging opening narration for a new D&D adventure of type '{adventure_type}' with {num_characters} heroes. Keep it under 150 words. Do NOT provide any options or choices for the adventure; simply set the stage and describe the scene that is currently happening."
+        heroes_text = "\n".join(char_descriptions)
+        intro_prompt = (
+            f"Write a short, engaging opening narration for a new D&D adventure of type '{adventure_type}'. "
+            f"Embed these heroes into the scene:\n{heroes_text}\n"
+            "Keep it under 150 words. Do NOT provide any options or choices for the adventure; simply set the stage and describe the scene that is currently happening."
+        )
         intro_text = await self.generate_ai_response(channel_id, intro_prompt)
         return intro_text
 
@@ -337,16 +377,19 @@ async def main():
     mock_discord_channel_id = "1049382059384"
     
     # Initialize game for channel
-    intro = await engine.start_new_game(mock_discord_channel_id, 1, "dungeon delve")
+    chars = [{
+        "name": "Brogbar", "race": "Orc", "class": "Barbarian", "physical": "tall", "personality": "angry"
+    }]
+    intro = await engine.start_new_game(mock_discord_channel_id, chars, "dungeon delve")
     print(f"Intro: {intro[:100]}...\n")
     
-    check_result = await engine.perform_ability_check(mock_discord_channel_id, "Player1", Stat.DEX, 16)
+    check_result = await engine.perform_ability_check(mock_discord_channel_id, "Brogbar", Stat.DEX, 16)
     print(json.dumps(check_result, indent=4))
 
-    damage_result = await engine.apply_damage(mock_discord_channel_id, "Player1", 8)
+    damage_result = await engine.apply_damage(mock_discord_channel_id, "Brogbar", 8)
     print(json.dumps(damage_result, indent=4))
     
-    await engine.combat_initiative(mock_discord_channel_id, "Player1")
+    await engine.combat_initiative(mock_discord_channel_id, "Brogbar")
     
     status_result = await engine.apply_status_effect(mock_discord_channel_id, "Enemy1", Condition.POISONED, 3)
     print(json.dumps(status_result, indent=4))
