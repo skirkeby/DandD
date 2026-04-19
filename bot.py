@@ -66,11 +66,14 @@ async def roll_check(ctx, stat: str, dc: int):
             await ctx.send(f"❌ Invalid stat '{stat}'. Valid stats are: {', '.join([s.value for s in Stat])}")
             return
             
-        # Hardcoding "Player1" for demonstration
-        # Ideally, we map discord User ID to character ID in the future
-        player_id = "Player1"
+        user_id = str(ctx.author.id)
         channel_id = str(ctx.channel.id)
+        player_id = await engine.get_bound_character(user_id, channel_id)
         
+        if not player_id:
+            await ctx.send("❌ You haven't bound a character yet! Use `!bind [Character Name]` first.")
+            return
+            
         result = await engine.perform_ability_check(channel_id, player_id, stat_enum, dc)
         
         if "error" in result:
@@ -127,9 +130,14 @@ async def roll_initiative(ctx):
     Example: !initiative
     """
     try:
-        player_id = "Player1"
+        user_id = str(ctx.author.id)
         channel_id = str(ctx.channel.id)
+        player_id = await engine.get_bound_character(user_id, channel_id)
         
+        if not player_id:
+            await ctx.send("❌ You haven't bound a character yet! Use `!bind [Character Name]` first.")
+            return
+            
         result = await engine.combat_initiative(channel_id, player_id)
         
         if "error" in result:
@@ -197,6 +205,186 @@ async def ask_ai(ctx, *, prompt: str):
     except Exception as e:
         await ctx.send(f"An error occurred: {e}")
 
+@bot.command(name='log')
+async def log_event(ctx, *, event_text: str):
+    """
+    Log an important event so the AI remembers it permanently!
+    Example: !log Brogbar found a cursed amulet
+    """
+    try:
+        channel_id = str(ctx.channel.id)
+        await engine.add_game_event(channel_id, event_text)
+        await ctx.send(f"✅ Event permanently logged to context: **{event_text}**")
+    except Exception as e:
+        await ctx.send(f"An error occurred: {e}")
+
+@bot.command(name='bind')
+async def bind_char(ctx, *, character_name: str):
+    """
+    Binds you to control a specific character in this channel.
+    Example: !bind Brogbar
+    """
+    try:
+        user_id = str(ctx.author.id)
+        channel_id = str(ctx.channel.id)
+        result = await engine.bind_user_to_character(user_id, channel_id, character_name)
+        if not result['success']:
+            await ctx.send(f"❌ Error: {result['error']}")
+        else:
+            await ctx.send(f"✅ You are now bound to **{result['character_id']}** in this channel!")
+    except Exception as e:
+        await ctx.send(f"An error occurred: {e}")
+
+@bot.command(name='release')
+async def release_char(ctx):
+    """
+    Releases your currently bound character in this channel.
+    Example: !release
+    """
+    try:
+        user_id = str(ctx.author.id)
+        channel_id = str(ctx.channel.id)
+        await engine.release_user_character(user_id, channel_id)
+        await ctx.send(f"✅ You have released control of your character in this channel.")
+    except Exception as e:
+        await ctx.send(f"An error occurred: {e}")
+
+@bot.command(name='who')
+async def who_is_playing(ctx):
+    """
+    Displays all characters in the current adventure and who is controlling them.
+    Example: !who
+    """
+    try:
+        channel_id = str(ctx.channel.id)
+        bindings = await engine.get_all_characters_and_bindings(channel_id)
+        
+        if not bindings:
+            await ctx.send("No characters are currently in this adventure! Run `!new_game` to start.")
+            return
+            
+        embed = discord.Embed(
+            title="🎭 Adventuring Party",
+            color=discord.Color.purple()
+        )
+        for char_name, user_id in bindings.items():
+            if user_id:
+                player_mention = f"<@{user_id}>"
+            else:
+                player_mention = "*Unbound*"
+            embed.add_field(name=char_name, value=player_mention, inline=False)
+            
+        await ctx.send(embed=embed)
+        
+    except Exception as e:
+        await ctx.send(f"An error occurred: {e}")
+
+@bot.command(name='sheet')
+async def character_sheet(ctx):
+    """
+    Displays the character sheet for your bound character.
+    Example: !sheet
+    """
+    try:
+        user_id = str(ctx.author.id)
+        channel_id = str(ctx.channel.id)
+        player_id = await engine.get_bound_character(user_id, channel_id)
+        
+        if not player_id:
+            await ctx.send("❌ You haven't bound a character yet! Use `!bind [Character Name]` first.")
+            return
+            
+        state = await engine.get_character_state(channel_id, player_id)
+        if "error" in state:
+            await ctx.send(f"❌ Error fetching sheet: {state['error']}")
+            return
+            
+        stats = state.get("stats", {})
+        stats_str = " | ".join([f"**{k}**: {v}" for k, v in stats.items()]) if stats else "None"
+        
+        effects = state.get("effects", [])
+        effects_str = ", ".join([f"{e['name']} ({e['duration']} turns)" for e in effects]) if effects else "None"
+        
+        embed = discord.Embed(
+            title=f"📜 Character Sheet: {player_id}",
+            color=discord.Color.teal()
+        )
+        embed.add_field(name="HP", value=f"{state.get('hp', 0)}/{state.get('max_hp', 0)} (Temp: {state.get('temp_hp', 0)})", inline=True)
+        embed.add_field(name="Armor Class (AC)", value=state.get('ac', 10), inline=True)
+        embed.add_field(name="Stats", value=stats_str, inline=False)
+        embed.add_field(name="Active Effects", value=effects_str, inline=False)
+        
+        await ctx.send(embed=embed)
+        
+    except Exception as e:
+        await ctx.send(f"An error occurred: {e}")
+
+@bot.command(name='inv')
+async def show_inventory(ctx):
+    """Shows the currently bound character's inventory."""
+    try:
+        user_id = str(ctx.author.id)
+        channel_id = str(ctx.channel.id)
+        player_id = await engine.get_bound_character(user_id, channel_id)
+        if not player_id:
+            await ctx.send("❌ You haven't bound a character yet! Use `!bind [Character Name]` first.")
+            return
+            
+        items = await engine.get_inventory(channel_id, player_id)
+        
+        embed = discord.Embed(title=f"🎒 {player_id}'s Inventory", color=discord.Color.gold())
+        if not items:
+            embed.description = "*Your backpack is completely empty.*"
+        else:
+            embed.description = "\n".join([f"• {item}" for item in items])
+            
+        await ctx.send(embed=embed)
+    except Exception as e:
+        await ctx.send(f"An error occurred: {e}")
+
+@bot.command(name='give')
+async def give_item(ctx, *, item_name: str):
+    """Gives an item to your currently bound character."""
+    try:
+        user_id = str(ctx.author.id)
+        channel_id = str(ctx.channel.id)
+        player_id = await engine.get_bound_character(user_id, channel_id)
+        if not player_id:
+            await ctx.send("❌ You haven't bound a character yet! Use `!bind [Character Name]` first.")
+            return
+            
+        items = await engine.get_inventory(channel_id, player_id)
+        items.append(item_name)
+        await engine.update_inventory(channel_id, player_id, items)
+        
+        await ctx.send(f"✅ Added **{item_name}** to {player_id}'s inventory.")
+    except Exception as e:
+        await ctx.send(f"An error occurred: {e}")
+
+@bot.command(name='drop')
+async def drop_item(ctx, *, item_name: str):
+    """Drops an item from your currently bound character's inventory."""
+    try:
+        user_id = str(ctx.author.id)
+        channel_id = str(ctx.channel.id)
+        player_id = await engine.get_bound_character(user_id, channel_id)
+        if not player_id:
+            await ctx.send("❌ You haven't bound a character yet! Use `!bind [Character Name]` first.")
+            return
+            
+        items = await engine.get_inventory(channel_id, player_id)
+        # Case insensitive match and remove
+        for i, item in enumerate(items):
+            if item.lower() == item_name.lower():
+                removed = items.pop(i)
+                await engine.update_inventory(channel_id, player_id, items)
+                await ctx.send(f"🗑️ Dropped **{removed}** from {player_id}'s inventory.")
+                return
+                
+        await ctx.send(f"❌ {player_id} doesn't have an item called '{item_name}' in their backpack.")
+    except Exception as e:
+        await ctx.send(f"An error occurred: {e}")
+
 @bot.command(name='new_game')
 async def new_game_cmd(ctx):
     """
@@ -211,6 +399,10 @@ async def new_game_cmd(ctx):
         if msg.content.lower() not in ['yes', 'y']:
             await ctx.send("New game cancelled.")
             return
+            
+        await ctx.send("What level will this adventure be? (e.g., '1', '5', 'epic level')")
+        msg = await bot.wait_for('message', timeout=30.0, check=check)
+        adventure_level = msg.content
             
         await ctx.send("How many players will be in this adventure? (Enter a number)")
         msg = await bot.wait_for('message', timeout=30.0, check=check)
@@ -253,10 +445,10 @@ async def new_game_cmd(ctx):
         
         channel_id = str(ctx.channel.id)
         
-        await ctx.send(f"⏳ Generating a new {adventure_type} adventure for {num_players} players... Stand by.")
+        await ctx.send(f"⏳ Generating a new Level {adventure_level} {adventure_type} adventure for {num_players} players... Stand by.")
         
         async with ctx.typing():
-            intro = await engine.start_new_game(channel_id, characters_info, adventure_type)
+            intro = await engine.start_new_game(channel_id, characters_info, adventure_type, adventure_level)
             
         if len(intro) > 1990:
             intro = intro[:1990] + "..."
@@ -274,7 +466,20 @@ async def new_game_cmd(ctx):
     except Exception as e:
         await ctx.send(f"An error occurred: {e}")
 
+import socket
+import sys
+
+def prevent_multiple_instances():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.bind(("127.0.0.1", 24816)) # Arbitrary unused local port
+        return s
+    except socket.error:
+        print("ERROR: Another instance of the bot is already running. Exiting.")
+        sys.exit(1)
+
 if __name__ == "__main__":
+    _instance_lock = prevent_multiple_instances()
     if not TOKEN or TOKEN == "your_token_here_replace_this":
         print("ERROR: Please set your Discord Token in the .env file.")
     else:
