@@ -305,13 +305,24 @@ async def character_sheet(ctx):
         effects = state.get("effects", [])
         effects_str = ", ".join([f"{e['name']} ({e['duration']} turns)" for e in effects]) if effects else "None"
         
+        abilities = state.get("abilities", [])
+        abilities_str = "\n".join([f"✨ **{ab}**" for ab in abilities]) if abilities else "*None*"
+        
+        embed_title = f"📜 Character Sheet: {player_id}"
+        c_level = state.get("level", 1)
+        c_class = state.get("class", "")
+        c_race = state.get("race", "")
+        if c_class or c_race:
+            embed_title = f"📜 {player_id} - Level {c_level} {c_race} {c_class}".strip()
+
         embed = discord.Embed(
-            title=f"📜 Character Sheet: {player_id}",
+            title=embed_title,
             color=discord.Color.teal()
         )
         embed.add_field(name="HP", value=f"{state.get('hp', 0)}/{state.get('max_hp', 0)} (Temp: {state.get('temp_hp', 0)})", inline=True)
         embed.add_field(name="Armor Class (AC)", value=state.get('ac', 10), inline=True)
         embed.add_field(name="Stats", value=stats_str, inline=False)
+        embed.add_field(name="Spells & Features", value=abilities_str, inline=False)
         embed.add_field(name="Active Effects", value=effects_str, inline=False)
         
         await ctx.send(embed=embed)

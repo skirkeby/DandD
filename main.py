@@ -3,6 +3,7 @@ import json
 import asyncio
 import aiosqlite
 import ollama
+import os
 from typing import Dict, Any, Union
 from enum import Enum
 
@@ -46,10 +47,15 @@ async def init_db(db_path: str = DB_PATH):
             )
         ''')
         
-        try:
-            await db.execute('ALTER TABLE characters ADD COLUMN inventory TEXT DEFAULT "[]"')
-        except Exception:
-            pass # Column already exists
+        for c_col, c_type in [("inventory", "TEXT DEFAULT '[]'"), 
+                              ("abilities", "TEXT DEFAULT '[]'"),
+                              ("level", "INTEGER DEFAULT 1"),
+                              ("class", "TEXT DEFAULT ''"),
+                              ("race", "TEXT DEFAULT ''")]:
+            try:
+                await db.execute(f'ALTER TABLE characters ADD COLUMN "{c_col}" {c_type}')
+            except Exception:
+                pass
         
         await db.execute('''
             CREATE TABLE IF NOT EXISTS channel_settings (
@@ -173,6 +179,12 @@ class DndEngine:
                 state["inventory"] = json.loads(state["inventory"])
             except:
                 state["inventory"] = []
+                
+        if isinstance(state.get("abilities"), str):
+            try:
+                state["abilities"] = json.loads(state["abilities"])
+            except:
+                state["abilities"] = []
             
         return state
 
@@ -187,7 +199,7 @@ class DndEngine:
         values = []
         for key, value in updates.items():
             set_clauses.append(f"{key} = ?")
-            if key in ["stats", "effects", "inventory"] and isinstance(value, (dict, list)):
+            if key in ["stats", "effects", "inventory", "abilities"] and isinstance(value, (dict, list)):
                 values.append(json.dumps(value))
             else:
                 values.append(value)
@@ -330,8 +342,10 @@ class DndEngine:
         response_text = ""
         if engine_type == "ollama":
             try:
-                print(f"[Ollama] Generating chat response for channel {channel_id} with gemma4:e4b")
-                client = ollama.AsyncClient()
+                # Use environment variable for host mapping or default to localhost
+                ollama_host = os.environ.get('OLLAMA_HOST', 'http://127.0.0.1:11434')
+                print(f"[Ollama] Generating chat response for channel {channel_id} with gemma4:e4b on {ollama_host}")
+                client = ollama.AsyncClient(host=ollama_host)
                 response = await client.chat(model='gemma4:e4b', messages=messages)
                 response_text = response['message']['content']
             except Exception as e:
@@ -367,34 +381,41 @@ class DndEngine:
             
         heroes_text = "\n".join(char_descriptions)
 
-        # Isolated AI Generation for Inventories
-        item_prompt = (
-            f"You are a D&D Loot Master. Fully outfit exactly each of these Level {adventure_level} heroes based on their race, class, and level:\n{heroes_text}\n"
-            f"Their inventory MUST include: 1) An interesting, themed primary weapon. 2) Specific armor or robes fitting their class. "
-            f"3) An adventuring pack/tool. 4) A thematic magic item or trinket.\n"
-            "Format the output EXACTLY as a JSON dictionary mapping the character name to a list of their item strings. "
-            "Output ONLY the JSON."
+        # Isolated AI Generation for Gear & Abilities
+        generation_prompt = (
+            f"You are a Dungeons & Dragons 5e Rule Master. Fully outfit exactly each of these Level {adventure_level} heroes strictly following official 5e rules based on their race, class, and level:\n{heroes_text}\n"
+            f"Requirements per hero:\n"
+            f"1. 'inventory': A list containing a themed primary weapon, specific armor/robes, a pack/tool, and a thematic magic item/trinket appropriate for 5e.\n"
+            f"2. 'abilities': A list containing 2 to 4 canonical D&D 5e spells, class features, or racial abilities strictly appropriate for their specific class and level.\n"
+            f"3. 'ac': An integer representing their mathematically accurate Armor Class (AC) derived strictly from their generated 5e armor and class constraints.\n"
+            "Format the output EXACTLY as a JSON dictionary mapping the character name to another dictionary with keys 'inventory', 'abilities', and 'ac'. "
+            "Output ONLY the valid JSON and nothing else."
         )
-        inventories = {}
+        hero_data = {}
         engine_type = await self.get_channel_llm_engine(channel_id)
         if engine_type == "ollama":
             try:
-                print(f"[Ollama] Generating starting inventories for level {adventure_level}...")
-                client = ollama.AsyncClient()
-                response = await client.generate(model='gemma4:e4b', prompt=item_prompt, format='json')
+                ollama_host = os.environ.get('OLLAMA_HOST', 'http://127.0.0.1:11434')
+                print(f"[Ollama] Generating starting gear and abilities for level {adventure_level} on {ollama_host}...")
+                client = ollama.AsyncClient(host=ollama_host)
+                response = await client.generate(model='gemma4:e4b', prompt=generation_prompt, format='json')
                 raw_text = response['response'].strip()
                 if raw_text.startswith("```json"): raw_text = raw_text[7:]
                 if raw_text.startswith("```"): raw_text = raw_text[3:]
                 if raw_text.endswith("```"): raw_text = raw_text[:-3]
                 raw_dict = json.loads(raw_text.strip())
-                # Enforce case-insensitive matching in case LLM mutates capitalization
-                inventories = {k.lower(): v for k, v in raw_dict.items()}
+                # Enforce case-insensitive matching
+                hero_data = {k.lower(): v for k, v in raw_dict.items()}
             except Exception as e:
-                print(f"⚠️ Failed to parse AI inventories: {e}")
+                print(f"⚠️ Failed to parse AI hero data: {e}")
 
         # Insert characters with customized items
         for char in characters_info:
             c_name = char["name"]
+            c_level = int(adventure_level)
+            c_race_display = char["race"]
+            c_class_display = char["class"]
+            
             c_class = char["class"].lower()
             
             stats_dict = self.generate_class_stats(c_class)
@@ -403,31 +424,61 @@ class DndEngine:
             # Interesting fallback gear based on class heuristic
             fallback_weapon = "Forged Longsword"
             fallback_armor = "Chainmail Armor"
+            fallback_ac = 15
+            
             if "rogue" in c_class or "monk" in c_class: 
                 fallback_weapon = "Serrated Daggers"
                 fallback_armor = "Shadow-Weave Leather Armor"
+                fallback_ac = 14
             elif "wizard" in c_class or "sorcerer" in c_class or "warlock" in c_class: 
                 fallback_weapon = "Carved Arcane Staff"
                 fallback_armor = "Embroidered Spellcaster Robes"
+                fallback_ac = 11
             elif "cleric" in c_class or "paladin" in c_class: 
                 fallback_weapon = "Engraved Holy Mace"
                 fallback_armor = "Blessed Half-Plate Armor"
+                fallback_ac = 16
             elif "ranger" in c_class: 
                 fallback_weapon = "Strung Yew Longbow"
                 fallback_armor = "Camouflage Studded Leather"
+                fallback_ac = 15
             elif "barbarian" in c_class: 
                 fallback_weapon = "Heavy Battleaxe"
                 fallback_armor = "Bear-Hide Armor"
+                fallback_ac = 14
             elif "bard" in c_class: 
                 fallback_weapon = "Silver Rapier"
                 fallback_armor = "Tailored Duelist Leather"
+                fallback_ac = 13
+                
+            # Fallback abilities heuristic
+            fallback_abilities = ["Second Wind", "Action Surge"]
+            if "rogue" in c_class: fallback_abilities = ["Sneak Attack", "Cunning Action"]
+            elif "wizard" in c_class: fallback_abilities = ["Mage Armor", "Magic Missile", "Shield"]
+            elif "sorcerer" in c_class: fallback_abilities = ["Chaos Bolt", "Shield", "Metamagic"]
+            elif "cleric" in c_class: fallback_abilities = ["Cure Wounds", "Bless", "Channel Divinity"]
+            elif "paladin" in c_class: fallback_abilities = ["Lay on Hands", "Divine Smite", "Aura of Protection"]
+            elif "ranger" in c_class: fallback_abilities = ["Hunter's Mark", "Favored Foe"]
+            elif "barbarian" in c_class: fallback_abilities = ["Rage", "Danger Sense"]
+            elif "bard" in c_class: fallback_abilities = ["Bardic Inspiration", "Vicious Mockery", "Healing Word"]
+            elif "monk" in c_class: fallback_abilities = ["Flurry of Blows", "Unarmored Defense"]
+            elif "warlock" in c_class: fallback_abilities = ["Eldritch Blast", "Hex", "Armor of Shadows"]
             
-            c_inv_list = inventories.get(c_name.lower(), ["Adventurer's Pack", fallback_weapon, fallback_armor, "Minor Healing Potion"])
+            c_data = hero_data.get(c_name.lower(), {})
+            if "inventory" in c_data and isinstance(c_data["inventory"], list):
+                c_inv_list = c_data["inventory"]
+            else:
+                c_inv_list = c_data if isinstance(c_data, list) else ["Adventurer's Pack", fallback_weapon, fallback_armor, "Minor Healing Potion"]
+            
+            c_ab_list = c_data.get("abilities", fallback_abilities) if isinstance(c_data, dict) else fallback_abilities
+            c_ac = c_data.get("ac", fallback_ac) if isinstance(c_data, dict) else fallback_ac
+            
             c_inv_json = json.dumps(c_inv_list)
+            c_ab_json = json.dumps(c_ab_list)
             
             await self.db.execute(
-                "INSERT INTO characters (id, channel_id, hp, max_hp, temp_hp, ac, stats, effects, inventory) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (c_name, channel_id, 25, 25, 0, 15, stats_json, "[]", c_inv_json)
+                "INSERT INTO characters (id, channel_id, hp, max_hp, temp_hp, ac, stats, effects, inventory, abilities, level, class, race) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (c_name, channel_id, 25, 25, 0, c_ac, stats_json, "[]", c_inv_json, c_ab_json, c_level, c_class_display, c_race_display)
             )
         await self.db.commit()
         
