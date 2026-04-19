@@ -27,7 +27,9 @@ class Condition(str, Enum):
 # Represents libraries like `aiosqlite` and `redis.asyncio`
 # =============================================================================
 
-async def init_db(db_path: str = "dnd_database.db"):
+DB_PATH = "dnd_database.db"
+
+async def init_db(db_path: str = DB_PATH):
     async with aiosqlite.connect(db_path) as db:
         await db.execute('''
             CREATE TABLE IF NOT EXISTS characters (
@@ -161,7 +163,7 @@ class DndEngine:
 
         # Calculate modifier dynamically
         modifier = self.get_modifier(raw_score)
-        roll = random.randint(1, 20)
+        roll = self.roll_dice(20, 1)
         total = roll + modifier
         success = total >= target_dc
 
@@ -183,10 +185,13 @@ class DndEngine:
     async def combat_initiative(self, player_id: str, channel_id: str) -> Dict[str, Any]:
         """Rolls initiative and maps it to a specific Discord channel."""
         state = await self.get_character_state(player_id)
+        if "error" in state:
+            return {"action": "Combat Initiative", "player_id": player_id, "success": False, "error": state["error"]}
+            
         raw_dex = state.get("stats", {}).get(Stat.DEX.value, 10)
         dex_mod = self.get_modifier(raw_dex)
         
-        roll = random.randint(1, 20)
+        roll = self.roll_dice(20, 1)
         initiative_score = roll + dex_mod
         
         # BEST PRACTICE: Bind the combat cache to the Discord Channel/Thread ID
@@ -203,6 +208,9 @@ class DndEngine:
     async def apply_damage(self, target_id: str, damage_amount: int) -> Dict[str, Any]:
         """Applies damage, prioritizing Temporary HP before actual HP."""
         state = await self.get_character_state(target_id)
+        if "error" in state:
+            return {"action": "Damage Application", "target": target_id, "success": False, "error": state["error"]}
+            
         hp = state.get("hp", 0)
         temp_hp = state.get("temp_hp", 0)
         
@@ -234,6 +242,9 @@ class DndEngine:
 
     async def apply_status_effect(self, target_id: str, effect: Condition, duration: int) -> Dict[str, Any]:
         state = await self.get_character_state(target_id)
+        if "error" in state:
+            return {"action": "Status Effect", "target": target_id, "success": False, "error": state["error"]}
+            
         effects_list = state.get("effects", [])
         
         effects_list.append({
@@ -256,7 +267,7 @@ class DndEngine:
 
 async def main():
     await init_db()
-    db_conn = await aiosqlite.connect("dnd_database.db")
+    db_conn = await aiosqlite.connect(DB_PATH)
     db_conn.row_factory = aiosqlite.Row
     redis_client = MockAsyncRedisClient()
     engine = DndEngine(db_conn, redis_client)
