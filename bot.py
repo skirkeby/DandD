@@ -396,6 +396,31 @@ async def drop_item(ctx, *, item_name: str):
     except Exception as e:
         await ctx.send(f"An error occurred: {e}")
 
+@bot.command(name='commands', aliases=['cmds'])
+async def list_commands(ctx):
+    """Lists all available commands and a short description."""
+    try:
+        embed = discord.Embed(
+            title="📚 Available Commands",
+            color=discord.Color.blue(),
+            description="Here is a list of all commands you can use:"
+        )
+        
+        sorted_commands = sorted(bot.commands, key=lambda c: c.name)
+        
+        for command in sorted_commands:
+            if not command.hidden and command.name != 'help':
+                short_desc = command.help.strip().split('\n')[0].strip() if command.help else "No description available."
+                embed.add_field(
+                    name=f"!{command.name}", 
+                    value=short_desc,
+                    inline=False
+                )
+                
+        await ctx.send(embed=embed)
+    except Exception as e:
+        await ctx.send(f"An error occurred: {e}")
+
 @bot.command(name='new_game')
 async def new_game_cmd(ctx):
     """
